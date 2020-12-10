@@ -7,23 +7,32 @@ package mr
 //
 
 import "os"
+import "time"
 import "strconv"
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
-
 // Add your RPC definitions here.
+type task struct {
+	Action string
+	File string
+}
 
+type worker struct {
+	UUID 		string
+	Status 		string
+	TaskTimeout time.Time
+	Task 		*task
+}
+
+type Args struct {
+	Worker *worker
+}
+
+type Reply struct {
+	NReduce int
+	IsMapFinished bool
+	IsAllFinished bool
+	NextWorker *worker
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
