@@ -173,7 +173,7 @@ func (m *Master) AddWorker(current *worker) (NextWorker *worker) {
 	return
 }
 
-func (m *Master) Sycn(args *Args, reply *Reply) error {
+func (m *Master) Sync(args *Args, reply *Reply) error {
 	switch args.Worker.Status {
 	case "idle":
 		reply.NextWorker = m.AddWorker(args.Worker)
