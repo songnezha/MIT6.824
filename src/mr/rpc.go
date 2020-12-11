@@ -6,21 +6,23 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "time"
-import "strconv"
+import (
+	"os"
+	"strconv"
+	"time"
+)
 
 // Add your RPC definitions here.
 type task struct {
 	Action string
-	File string
+	File   string
 }
 
 type worker struct {
-	UUID 		string
-	Status 		string
+	UUID        string
+	Status      string
 	TaskTimeout time.Time
-	Task 		*task
+	Task        *task
 }
 
 type Args struct {
@@ -28,10 +30,10 @@ type Args struct {
 }
 
 type Reply struct {
-	NReduce int
+	NReduce       int
 	IsMapFinished bool
 	IsAllFinished bool
-	NextWorker *worker
+	NextWorker    *worker
 }
 
 // Cook up a unique-ish UNIX-domain socket name
