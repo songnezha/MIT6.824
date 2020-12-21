@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -92,10 +93,14 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	term = rf.currentTerm
+	isleader = rf.role == ROLE_LEADER
 	return term, isleader
 }
 
@@ -179,6 +184,46 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.VoteGraunted = false
+
+	DPrintf("Raft Node[%d] Handle RequestVote, CandidatesId[%d] Term[%d] CurrentTerm[%d] LastLogIndex[%d] LastLogTerm[%d] votedFor[%d]",
+		rf.me, args.CandidateId, args.Term, rf.currentTerm, args.LastLogIndex, args.LastLogTerm, rf.votedFor)
+
+	defer func() {
+		DPrintf("Raft Node[%d] Return RequestVote, CandidatesId[%d] VoteGranted[%v] ", rf.me, args.CandidateId, reply.VoteGraunted)
+	}()
+
+	// 如果 term < currentTerm 返回 false
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.role = ROLE_FOLLOWER
+		rf.votedFor = -1
+		rf.leaderId = -1
+	}
+
+	// 如果 votedFor 为空或者为 candidateId，并且候选⼈的⽇志⾄少和⾃⼰⼀样新，那么就投票给他
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		lastLogTerm := 0
+		if len(rf.log) != 0 {
+			lastLogTerm = rf.log[len(rf.log)-1].Term
+		}
+		if args.LastLogTerm < lastLogTerm || args.LastLogIndex < len(rf.log) {
+			return
+		}
+		rf.votedFor = args.CandidateId
+		reply.VoteGraunted = true
+		rf.lastActiveTime = time.Now()
+	}
+
+	rf.persist()
 }
 
 //
@@ -260,6 +305,216 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) electionLoop() {
+	for !rf.killed() {
+		time.Sleep(1 * time.Millisecond)
+
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			now := time.Now()
+			timeout := time.Duration(200+rand.Int31n(150)) * time.Millisecond
+			elapses := now.Sub(rf.lastActiveTime)
+			if rf.role == ROLE_FOLLOWER {
+				if elapses >= timeout {
+					rf.role = ROLE_CANDIDATES
+					DPrintf("Raft Node[%d] FOLLOWER => CANDIDATE", rf.me)
+				}
+			}
+			// Ask for Vote
+			if rf.role == ROLE_CANDIDATES && elapses >= timeout {
+				rf.lastActiveTime = now
+				rf.currentTerm++
+				rf.votedFor = rf.me
+				rf.persist()
+
+				args := RequestVoteArgs{
+					Term:         rf.currentTerm,
+					CandidateId:  rf.me,
+					LastLogIndex: len(rf.log),
+				}
+				if len(rf.log) != 0 {
+					args.LastLogTerm = rf.log[len(rf.log)-1].Term
+				}
+				rf.mu.Unlock()
+
+				DPrintf("Raft Node[%d] RequestVote starts, Term[%d] LastLogIndex[%d] LastLogTerm[%d]", rf.me, args.Term,
+					args.LastLogIndex, args.LastLogTerm)
+
+				//RPC Ask for Vote
+				type VoteResult struct {
+					peerId int
+					resp   *RequestVoteReply
+				}
+
+				voteCount := 1   //收到投票数，自己一票
+				finishCount := 1 //收到应答数
+				voteRsultChan := make(chan *VoteResult, len(rf.peers))
+				for peerId := 0; peerId < len(rf.peers); peerId++ {
+					go func(id int) {
+						if id == rf.me {
+							return
+						}
+						resp := RequestVoteReply{}
+						if ok := rf.sendRequestVote(id, &args, &resp); ok {
+							voteRsultChan <- &VoteResult{
+								peerId: id,
+								resp:   &resp,
+							}
+						} else {
+							voteRsultChan <- &VoteResult{
+								peerId: id,
+								resp:   nil,
+							}
+						}
+					}(peerId)
+				}
+
+				maxTerm := 0
+				for {
+					select {
+					case VoteResult := <-voteRsultChan:
+						finishCount++
+						if VoteResult.resp != nil {
+							if VoteResult.resp.VoteGraunted {
+								voteCount++
+							}
+							if VoteResult.resp.Term > maxTerm {
+								maxTerm = VoteResult.resp.Term
+							}
+						}
+						if finishCount == len(rf.peers) || voteCount > len(rf.peers)/2 {
+							goto END
+						}
+					}
+				}
+			END:
+				rf.mu.Lock()
+
+				defer func() {
+					DPrintf("Raft Node[%d] RequestVote ends, finishCount[%d] voteCount[%d] Role[%s] maxTerm[%d] currentTerm[%d]", rf.me, finishCount, voteCount,
+						rf.role, maxTerm, rf.currentTerm)
+				}()
+
+				// 若此时不是候选人，则直接忽略投票结果
+				if rf.role != ROLE_CANDIDATES {
+					return
+				}
+				// 发现了更高的term，切换回FOLLWER
+				if maxTerm > rf.currentTerm {
+					rf.role = ROLE_FOLLOWER
+					rf.leaderId = -1
+					rf.votedFor = -1
+					rf.currentTerm = maxTerm
+					rf.persist()
+					return
+				}
+				// 成为LEADER
+				if voteCount > len(rf.peers)/2 {
+					rf.role = ROLE_LEADER
+					rf.leaderId = rf.me
+					rf.lastBroadcastTime = time.Unix(0, 0)
+					return
+				}
+			}
+		}()
+	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DPrintf("Raft Node[%d] Handle AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%s]",
+		rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.role)
+	defer func() {
+		DPrintf("Raft Node[%d] Return AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%s]",
+			rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.role)
+	}()
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.role = ROLE_FOLLOWER
+		rf.votedFor = -1
+		rf.leaderId = -1
+	}
+
+	rf.leaderId = args.LeaderId
+	rf.lastBroadcastTime = time.Now()
+	rf.persist()
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// lab-2A实现心跳
+func (rf *Raft) appendEntriesLoop() {
+	for !rf.killed() {
+		time.Sleep(1 * time.Millisecond)
+
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			// 只有LEADER广播心跳
+			if rf.role != ROLE_LEADER {
+				return
+			}
+			// 100ms广播一次
+			now := time.Now()
+			if now.Sub(rf.lastBroadcastTime) < 100*time.Millisecond {
+				return
+			}
+			rf.lastBroadcastTime = time.Now()
+
+			//RPC 心跳
+			type AppendResult struct {
+				peerId int
+				resp   *AppendEntriesReply
+			}
+
+			for peerId := 0; peerId < len(rf.peers); peerId++ {
+				if peerId == rf.me {
+					continue
+				}
+				args := AppendEntriesArgs{
+					Term:     rf.currentTerm,
+					LeaderId: rf.me,
+					//log字段在2A不处理
+				}
+
+				go func(id int) {
+					DPrintf("RaftNode[%d] appendEntries starts, myTerm[%d] peerId[%d]", rf.me, args.Term, id)
+					reply := AppendEntriesReply{}
+					if ok := rf.sendAppendEntries(id, &args, &reply); ok {
+						rf.mu.Lock()
+						defer rf.mu.Unlock()
+						// 变成FOLLOWER
+						if reply.Term > rf.currentTerm {
+							rf.role = ROLE_FOLLOWER
+							rf.leaderId = -1
+							rf.votedFor = -1
+							rf.currentTerm = reply.Term
+							rf.persist()
+						}
+						DPrintf("RaftNode[%d] appendEntries ends, peerTerm[%d] myCurrentTerm[%d] myRole[%s]", rf.me, reply.Term, rf.currentTerm, rf.role)
+					}
+				}(peerId)
+			}
+		}()
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -279,9 +534,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.role = ROLE_FOLLOWER
+	rf.leaderId = -1
+	rf.votedFor = -1
+	rf.lastActiveTime = time.Now()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	// election
+	go rf.electionLoop()
+
+	// leader
+	go rf.appendEntriesLoop()
+
+	DPrintf("Raft Node[%d] START", me)
 
 	return rf
 }
